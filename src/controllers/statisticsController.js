@@ -2,6 +2,8 @@ import Appointment from '../models/Appointment.js';
 import Schedule from '../models/Schedule.js';
 import Slot from '../models/Slot.js';
 import Doctor from '../models/Doctor.js';
+import Waitlist from '../models/Waitlist.js';
+import Notification from '../models/Notification.js';
 import { success, fail, HttpCode } from '../utils/response.js';
 import { startOfDay, endOfDay, formatDate, parseDate } from '../utils/dateUtils.js';
 
@@ -297,6 +299,242 @@ export async function getAbnormalSchedules(req, res) {
 
     abnormalSchedules.sort((a, b) => a.date.localeCompare(b.date));
     res.json(success(abnormalSchedules));
+  } catch (error) {
+    res.status(HttpCode.INTERNAL_ERROR).json(fail(error.message, HttpCode.INTERNAL_ERROR));
+  }
+}
+
+export async function getAdminSummary(req, res) {
+  try {
+    const { department, doctorId, date } = req.query;
+
+    const doctorFilter = {};
+    if (department) doctorFilter.department = department;
+    if (doctorId) doctorFilter._id = doctorId;
+
+    const doctors = await Doctor.find(doctorFilter).select('_id name department');
+    const doctorIds = doctors.map(d => d._id);
+    const doctorMap = new Map(doctors.map(d => [d._id.toString(), d]));
+
+    let slotFilter = { doctorId: { $in: doctorIds } };
+    if (date) {
+      const dayStart = startOfDay(parseDate(date));
+      const dayEnd = endOfDay(parseDate(date));
+      slotFilter.date = { $gte: dayStart, $lte: dayEnd };
+    }
+
+    const slots = await Slot.find(slotFilter).select('_id doctorId date startTime endTime status scheduleId');
+    const slotIds = slots.map(s => s._id);
+
+    const scheduleIds = [...new Set(slots.map(s => s.scheduleId).filter(Boolean))];
+    const schedules = await Schedule.find({ _id: { $in: scheduleIds } })
+      .select('_id doctorId date startTime endTime type status reason');
+    const scheduleMap = new Map(schedules.map(s => [s._id.toString(), s]));
+
+    const appointments = await Appointment.find({
+      slotId: { $in: slotIds },
+      status: { $in: ['confirmed', 'cancelled', 'no_show', 'pending'] }
+    }).select('_id slotId patientName patientPhone status cancelReason createdAt');
+
+    const waitlists = await Waitlist.find({
+      doctorId: { $in: doctorIds },
+      status: { $in: ['waiting', 'notification_sent'] }
+    }).select('_id slotId doctorId patientName patientPhone position status createdAt');
+
+    const summary = [];
+    for (const doctor of doctors) {
+      const docSlots = slots.filter(s => s.doctorId.toString() === doctor._id.toString());
+      const docSlotIds = docSlots.map(s => s._id);
+      const docAppointments = appointments.filter(a => docSlotIds.some(id => id.toString() === a.slotId.toString()));
+      const docWaitlists = waitlists.filter(w => w.doctorId.toString() === doctor._id.toString());
+      const docSchedules = schedules.filter(s => s.doctorId.toString() === doctor._id.toString());
+
+      const totalSlots = docSlots.length;
+      const bookedSlots = docSlots.filter(s => s.status === 'booked').length;
+      const availableSlots = docSlots.filter(s => s.status === 'available').length;
+      const lockedSlots = docSlots.filter(s => s.status === 'locked').length;
+      const suspendedSlots = docSlots.filter(s => s.status === 'suspended').length;
+      const effectiveTotal = totalSlots - suspendedSlots;
+
+      const confirmed = docAppointments.filter(a => a.status === 'confirmed').length;
+      const cancelled = docAppointments.filter(a => a.status === 'cancelled').length;
+      const noShow = docAppointments.filter(a => a.status === 'no_show').length;
+      const totalAppointments = confirmed + cancelled + noShow;
+
+      const regularSchedules = docSchedules.filter(s => s.type === 'regular').length;
+      const temporarySchedules = docSchedules.filter(s => s.type === 'temporary').length;
+      const suspensionSchedules = docSchedules.filter(s => s.type === 'suspension').length;
+
+      const waitingCount = docWaitlists.filter(w => w.status === 'waiting').length;
+      const notifiedCount = docWaitlists.filter(w => w.status === 'notification_sent').length;
+
+      const emptyRate = effectiveTotal > 0 ? (effectiveTotal - bookedSlots) / effectiveTotal : 0;
+      const cancelRate = totalAppointments > 0 ? cancelled / totalAppointments : 0;
+
+      summary.push({
+        doctorId: doctor._id,
+        doctorName: doctor.name,
+        department: doctor.department,
+        date: date ? formatDate(parseDate(date)) : null,
+        schedules: {
+          total: docSchedules.length,
+          regular: regularSchedules,
+          temporary: temporarySchedules,
+          suspension: suspensionSchedules
+        },
+        slots: {
+          total: totalSlots,
+          effective: effectiveTotal,
+          booked: bookedSlots,
+          available: availableSlots,
+          locked: lockedSlots,
+          suspended: suspendedSlots
+        },
+        appointments: {
+          total: totalAppointments,
+          confirmed,
+          cancelled,
+          noShow
+        },
+        waitlist: {
+          total: docWaitlists.length,
+          waiting: waitingCount,
+          notificationSent: notifiedCount
+        },
+        rates: {
+          emptyRate: parseFloat(emptyRate.toFixed(4)),
+          cancelRate: parseFloat(cancelRate.toFixed(4)),
+          fillRate: parseFloat((bookedSlots / Math.max(effectiveTotal, 1)).toFixed(4))
+        }
+      });
+    }
+
+    summary.sort((a, b) => b.appointments.total - a.appointments.total);
+    res.json(success(summary));
+  } catch (error) {
+    res.status(HttpCode.INTERNAL_ERROR).json(fail(error.message, HttpCode.INTERNAL_ERROR));
+  }
+}
+
+export async function getScheduleDetail(req, res) {
+  try {
+    const { scheduleId } = req.params;
+
+    const schedule = await Schedule.findById(scheduleId).populate('doctorId', 'name department');
+    if (!schedule) {
+      return res.status(HttpCode.NOT_FOUND).json(fail('排班不存在', HttpCode.NOT_FOUND));
+    }
+
+    const slots = await Slot.find({ scheduleId }).sort({ startTime: 1 });
+    const slotIds = slots.map(s => s._id);
+
+    const appointments = await Appointment.find({
+      slotId: { $in: slotIds },
+      status: { $in: ['confirmed', 'cancelled', 'no_show', 'pending'] }
+    }).populate('slotId', 'startTime endTime');
+
+    const waitlists = await Waitlist.find({
+      slotId: { $in: slotIds },
+      status: { $in: ['waiting', 'notification_sent', 'confirmed', 'cancelled'] }
+    }).sort({ position: 1 });
+
+    const notifications = await Notification.find({
+      appointmentId: { $in: appointments.map(a => a._id) }
+    });
+
+    const totalSlots = slots.length;
+    const bookedSlots = slots.filter(s => s.status === 'booked').length;
+    const availableSlots = slots.filter(s => s.status === 'available').length;
+    const lockedSlots = slots.filter(s => s.status === 'locked').length;
+    const suspendedSlots = slots.filter(s => s.status === 'suspended').length;
+    const cancelledSlots = slots.filter(s => s.status === 'cancelled').length;
+    const effectiveTotal = totalSlots - suspendedSlots - cancelledSlots;
+
+    const confirmed = appointments.filter(a => a.status === 'confirmed').length;
+    const cancelled = appointments.filter(a => a.status === 'cancelled').length;
+    const noShow = appointments.filter(a => a.status === 'no_show').length;
+    const totalAppointments = confirmed + cancelled + noShow;
+
+    const emptyRate = effectiveTotal > 0 ? (effectiveTotal - bookedSlots) / effectiveTotal : 0;
+    const cancelRate = totalAppointments > 0 ? cancelled / totalAppointments : 0;
+
+    const cancelReasons = {};
+    for (const apt of appointments.filter(a => a.status === 'cancelled' && a.cancelReason)) {
+      const reason = apt.cancelReason;
+      cancelReasons[reason] = (cancelReasons[reason] || 0) + 1;
+    }
+
+    const slotDetails = slots.map(slot => {
+      const slotApts = appointments.filter(a => a.slotId.toString() === slot._id.toString());
+      const slotWaitlists = waitlists.filter(w => w.slotId.toString() === slot._id.toString());
+
+      return {
+        slotId: slot._id,
+        startTime: slot.startTime,
+        endTime: slot.endTime,
+        status: slot.status,
+        patientName: slot.patientName,
+        patientPhone: slot.patientPhone,
+        appointments: slotApts,
+        waitlistCount: slotWaitlists.length
+      };
+    });
+
+    const abnormalAnalysis = [];
+    if (emptyRate >= 0.5 && effectiveTotal >= 3) {
+      if (suspendedSlots > 0) {
+        abnormalAnalysis.push(`高空号率可能与停诊有关，共冻结 ${suspendedSlots} 个号源`);
+      }
+      if (availableSlots >= effectiveTotal * 0.5) {
+        abnormalAnalysis.push(`有 ${availableSlots} 个号源未被预约，可能与排班时段选择、医生知名度或科室需求有关`);
+      }
+    }
+    if (cancelRate >= 0.3 && totalAppointments >= 3) {
+      const topReason = Object.entries(cancelReasons).sort((a, b) => b[1] - a[1])[0];
+      if (topReason) {
+        abnormalAnalysis.push(`高取消率可能与"${topReason[0]}"有关，共 ${topReason[1]} 例`);
+      }
+      if (lockedSlots > 0) {
+        abnormalAnalysis.push(`当前有 ${lockedSlots} 个号源处于锁定状态未完成确认`);
+      }
+    }
+    if (schedule.type === 'suspension') {
+      abnormalAnalysis.push(`该排班为停诊记录，原因：${schedule.reason || '未填写'}`);
+    }
+
+    res.json(success({
+      schedule: {
+        id: schedule._id,
+        doctorName: schedule.doctorId?.name,
+        department: schedule.doctorId?.department,
+        date: formatDate(schedule.date),
+        startTime: schedule.startTime,
+        endTime: schedule.endTime,
+        type: schedule.type,
+        status: schedule.status,
+        reason: schedule.reason
+      },
+      summary: {
+        totalSlots,
+        effectiveTotal,
+        bookedSlots,
+        availableSlots,
+        lockedSlots,
+        suspendedSlots,
+        cancelledSlots,
+        totalAppointments,
+        confirmed,
+        cancelled,
+        noShow,
+        waitlistCount: waitlists.length,
+        emptyRate: parseFloat(emptyRate.toFixed(4)),
+        cancelRate: parseFloat(cancelRate.toFixed(4))
+      },
+      cancelReasons,
+      abnormalAnalysis,
+      slotDetails,
+      notifications
+    }));
   } catch (error) {
     res.status(HttpCode.INTERNAL_ERROR).json(fail(error.message, HttpCode.INTERNAL_ERROR));
   }

@@ -5,8 +5,11 @@ const { Schema } = mongoose;
 const notificationSchema = new Schema({
   appointmentId: {
     type: Schema.Types.ObjectId,
-    ref: 'Appointment',
-    required: true
+    ref: 'Appointment'
+  },
+  waitlistId: {
+    type: Schema.Types.ObjectId,
+    ref: 'Waitlist'
   },
   doctorId: {
     type: Schema.Types.ObjectId,
@@ -19,7 +22,7 @@ const notificationSchema = new Schema({
   },
   type: {
     type: String,
-    enum: ['reminder', 'cancelled', 'confirmed'],
+    enum: ['reminder', 'cancelled', 'confirmed', 'suspension', 'waitlist'],
     required: true
   },
   content: {
@@ -39,6 +42,7 @@ const notificationSchema = new Schema({
 notificationSchema.index({ doctorId: 1 });
 notificationSchema.index({ patientPhone: 1 });
 notificationSchema.index({ read: 1 });
+notificationSchema.index({ waitlistId: 1 });
 
 const Notification = mongoose.model('Notification', notificationSchema);
 

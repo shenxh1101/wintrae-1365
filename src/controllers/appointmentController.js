@@ -4,6 +4,8 @@ import Doctor from '../models/Doctor.js';
 import { success, fail, HttpCode } from '../utils/response.js';
 import config from '../config/index.js';
 import { withTransaction } from '../utils/transaction.js';
+import { createAppointmentConfirmed, createAppointmentCancelled } from '../services/notificationService.js';
+import { releaseSlot } from '../services/slotReleaseService.js';
 
 async function checkDuplicateBooking(doctorId, patientPhone, date, excludeSlotId = null) {
   const dayStart = new Date(date);
@@ -124,6 +126,11 @@ export async function confirmAppointment(req, res) {
       slot.appointmentId = appointment._id;
       await slot.save({ session });
 
+      const doctor = await Doctor.findById(slot.doctorId).session(session);
+      if (doctor) {
+        await createAppointmentConfirmed(appointment, slot, doctor, session);
+      }
+
       return { code: HttpCode.SUCCESS, data: success({ appointment, slot }, '预约确认成功') };
     });
 
@@ -153,21 +160,21 @@ export async function cancelAppointment(req, res) {
       }
 
       const slot = await Slot.findById(appointment.slotId).session(session);
+      const doctor = slot ? await Doctor.findById(slot.doctorId).session(session) : null;
 
       appointment.status = 'cancelled';
       appointment.cancelReason = reason;
       await appointment.save({ session });
 
+      let releaseResult = null;
       if (slot) {
-        slot.status = 'available';
-        slot.patientName = undefined;
-        slot.patientPhone = undefined;
-        slot.lockedAt = undefined;
-        slot.appointmentId = undefined;
-        await slot.save({ session });
+        releaseResult = await releaseSlot(slot._id, 'user_cancelled');
+        if (doctor) {
+          await createAppointmentCancelled(appointment, slot, doctor, reason, session);
+        }
       }
 
-      return { code: HttpCode.SUCCESS, data: success({ appointment, slot }, '预约取消成功') };
+      return { code: HttpCode.SUCCESS, data: success({ appointment, slot: releaseResult?.slot, notifiedWaitlist: releaseResult?.notifiedWaitlist }, '预约取消成功') };
     });
 
     return res.status(result.code).json(result.data);

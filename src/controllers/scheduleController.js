@@ -1,4 +1,6 @@
 import Schedule from '../models/Schedule.js';
+import Appointment from '../models/Appointment.js';
+import { createSuspensionNotification } from '../services/notificationService.js';
 import Slot from '../models/Slot.js';
 import Doctor from '../models/Doctor.js';
 import { success, fail, HttpCode } from '../utils/response.js';
@@ -100,20 +102,35 @@ export async function createSuspension(req, res) {
         date: { $gte: dayStart, $lte: dayEnd },
         startTime: { $gte: startTime },
         endTime: { $lte: endTime },
-        status: { $in: ['available', 'locked'] }
+        status: { $in: ['available', 'locked', 'booked'] }
       };
 
       const affectedSlots = await Slot.find(slotFilter).session(session);
 
       for (const slot of affectedSlots) {
-        if (slot.status === 'locked') {
-          const Appointment = (await import('../models/Appointment.js')).default;
-          await Appointment.updateOne(
-            { slotId: slot._id, status: { $in: ['pending', 'confirmed'] } },
-            { status: 'cancelled', cancelReason: `医生停诊：${reason || ''}` },
-            session ? { session } : {}
-          );
+        if (slot.status === 'locked' || slot.status === 'booked') {
+          const appointment = await Appointment.findOne({
+            slotId: slot._id,
+            status: { $in: ['pending', 'confirmed'] }
+          }).session(session);
+
+          if (appointment) {
+            appointment.status = 'cancelled';
+            appointment.cancelReason = `医生停诊：${reason || ''}`;
+            await appointment.save({ session });
+
+            await createSuspensionNotification(
+              slot,
+              doctor,
+              reason || '',
+              appointment.patientName,
+              appointment.patientPhone,
+              appointment._id,
+              session
+            );
+          }
         }
+
         slot.status = 'suspended';
         await slot.save(session ? { session } : {});
       }

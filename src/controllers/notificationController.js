@@ -82,12 +82,27 @@ export async function markNotificationRead(req, res) {
 
 export async function getNotificationList(req, res) {
   try {
-    const { doctorId, patientPhone, read, page = 1, pageSize = 10 } = req.query;
+    const { doctorId, patientPhone, read, type, startDate, endDate, page = 1, pageSize = 10 } = req.query;
 
     const filter = {};
     if (doctorId) filter.doctorId = doctorId;
     if (patientPhone) filter.patientPhone = patientPhone;
     if (read !== undefined) filter.read = read === 'true';
+    if (type) filter.type = type;
+
+    if (startDate || endDate) {
+      filter.sentAt = {};
+      if (startDate) {
+        const start = new Date(startDate);
+        start.setHours(0, 0, 0, 0);
+        filter.sentAt.$gte = start;
+      }
+      if (endDate) {
+        const end = new Date(endDate);
+        end.setHours(23, 59, 59, 999);
+        filter.sentAt.$lte = end;
+      }
+    }
 
     const skip = (page - 1) * pageSize;
     const limit = parseInt(pageSize);
@@ -95,6 +110,7 @@ export async function getNotificationList(req, res) {
     const [notifications, total] = await Promise.all([
       Notification.find(filter)
         .populate('appointmentId', 'patientName patientPhone status')
+        .populate('waitlistId', 'patientName patientPhone position status')
         .populate('doctorId', 'name department')
         .sort({ sentAt: -1 })
         .skip(skip)

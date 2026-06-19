@@ -6,6 +6,7 @@ import config from './config/index.js';
 import { notFoundHandler, errorHandler } from './middleware/errorHandler.js';
 import { success, fail, HttpCode } from './utils/response.js';
 import { splitTimeSlots } from './utils/dateUtils.js';
+import { startLockExpiryScheduler, stopLockExpiryScheduler } from './scheduler/lockExpiry.js';
 
 import doctorRoutes from './routes/doctorRoutes.js';
 import scheduleRoutes from './routes/scheduleRoutes.js';
@@ -13,6 +14,7 @@ import slotRoutes from './routes/slotRoutes.js';
 import appointmentRoutes from './routes/appointmentRoutes.js';
 import notificationRoutes from './routes/notificationRoutes.js';
 import statisticsRoutes from './routes/statisticsRoutes.js';
+import waitlistRoutes from './routes/waitlistRoutes.js';
 
 const app = express();
 
@@ -62,6 +64,7 @@ app.use('/api/slots', slotRoutes);
 app.use('/api/appointments', appointmentRoutes);
 app.use('/api/notifications', notificationRoutes);
 app.use('/api/statistics', statisticsRoutes);
+app.use('/api/waitlist', waitlistRoutes);
 
 app.use(notFoundHandler);
 app.use(errorHandler);
@@ -89,8 +92,13 @@ const startServer = async (skipDBConnect = false) => {
     console.log(`Slot split test: http://localhost:${config.port}/test/split-slots`);
   });
 
+  if (!skipDBConnect) {
+    startLockExpiryScheduler(1);
+  }
+
   process.on('SIGTERM', () => {
     console.log('SIGTERM received, shutting down gracefully');
+    stopLockExpiryScheduler();
     server.close(() => {
       mongoose.connection.close(false, () => {
         process.exit(0);
