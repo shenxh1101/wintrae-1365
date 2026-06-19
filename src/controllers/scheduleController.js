@@ -3,7 +3,7 @@ import Slot from '../models/Slot.js';
 import Doctor from '../models/Doctor.js';
 import { success, fail, HttpCode } from '../utils/response.js';
 import { parseDate, addDays, startOfDay, endOfDay } from '../utils/dateUtils.js';
-import mongoose from 'mongoose';
+import { withTransaction } from '../utils/transaction.js';
 
 export async function createWeeklySchedule(req, res) {
   try {
@@ -71,105 +71,100 @@ export async function createTemporarySchedule(req, res) {
 }
 
 export async function createSuspension(req, res) {
-  const session = await mongoose.startSession();
-  session.startTransaction();
-
   try {
     const { doctorId, date, startTime, endTime, reason } = req.body;
 
-    const doctor = await Doctor.findById(doctorId);
-    if (!doctor) {
-      await session.abortTransaction();
-      return res.status(HttpCode.NOT_FOUND).json(fail('医生不存在', HttpCode.NOT_FOUND));
-    }
-
-    const suspension = new Schedule({
-      doctorId,
-      date: startOfDay(parseDate(date)),
-      startTime,
-      endTime,
-      type: 'suspension',
-      status: 'active',
-      totalSlots: 0,
-      reason: reason || ''
-    });
-    await suspension.save({ session });
-
-    const dayStart = startOfDay(parseDate(date));
-    const dayEnd = endOfDay(parseDate(date));
-
-    const slotFilter = {
-      doctorId,
-      date: { $gte: dayStart, $lte: dayEnd },
-      startTime: { $gte: startTime },
-      endTime: { $lte: endTime },
-      status: { $in: ['available', 'locked'] }
-    };
-
-    const affectedSlots = await Slot.find(slotFilter).session(session);
-
-    for (const slot of affectedSlots) {
-      if (slot.status === 'locked') {
-        const Appointment = (await import('../models/Appointment.js')).default;
-        await Appointment.updateOne(
-          { slotId: slot._id, status: { $in: ['pending', 'confirmed'] } },
-          { status: 'cancelled', cancelReason: `医生停诊：${reason || ''}` },
-          { session }
-        );
+    const result = await withTransaction(async (session) => {
+      const doctor = await Doctor.findById(doctorId).session(session);
+      if (!doctor) {
+        return { code: HttpCode.NOT_FOUND, data: fail('医生不存在', HttpCode.NOT_FOUND) };
       }
-      slot.status = 'suspended';
-      await slot.save({ session });
-    }
 
-    await session.commitTransaction();
+      const suspension = new Schedule({
+        doctorId,
+        date: startOfDay(parseDate(date)),
+        startTime,
+        endTime,
+        type: 'suspension',
+        status: 'active',
+        totalSlots: 0,
+        reason: reason || ''
+      });
+      await suspension.save({ session });
 
-    return res.status(HttpCode.SUCCESS).json(success({
-      suspension,
-      suspendedSlotCount: affectedSlots.length
-    }, '停诊创建成功，对应号源已冻结'));
+      const dayStart = startOfDay(parseDate(date));
+      const dayEnd = endOfDay(parseDate(date));
+
+      const slotFilter = {
+        doctorId,
+        date: { $gte: dayStart, $lte: dayEnd },
+        startTime: { $gte: startTime },
+        endTime: { $lte: endTime },
+        status: { $in: ['available', 'locked'] }
+      };
+
+      const affectedSlots = await Slot.find(slotFilter).session(session);
+
+      for (const slot of affectedSlots) {
+        if (slot.status === 'locked') {
+          const Appointment = (await import('../models/Appointment.js')).default;
+          await Appointment.updateOne(
+            { slotId: slot._id, status: { $in: ['pending', 'confirmed'] } },
+            { status: 'cancelled', cancelReason: `医生停诊：${reason || ''}` },
+            session ? { session } : {}
+          );
+        }
+        slot.status = 'suspended';
+        await slot.save(session ? { session } : {});
+      }
+
+      return {
+        code: HttpCode.SUCCESS,
+        data: success({
+          suspension,
+          suspendedSlotCount: affectedSlots.length
+        }, '停诊创建成功，对应号源已冻结')
+      };
+    });
+
+    return res.status(result.code).json(result.data);
   } catch (error) {
-    await session.abortTransaction();
     return res.status(HttpCode.INTERNAL_ERROR).json(fail(error.message, HttpCode.INTERNAL_ERROR));
-  } finally {
-    session.endSession();
   }
 }
 
 export async function cancelSchedule(req, res) {
-  const session = await mongoose.startSession();
-  session.startTransaction();
-
   try {
     const { id } = req.params;
 
-    const schedule = await Schedule.findById(id).session(session);
-    if (!schedule) {
-      await session.abortTransaction();
-      return res.status(HttpCode.NOT_FOUND).json(fail('排班不存在', HttpCode.NOT_FOUND));
-    }
+    const result = await withTransaction(async (session) => {
+      const schedule = await Schedule.findById(id).session(session);
+      if (!schedule) {
+        return { code: HttpCode.NOT_FOUND, data: fail('排班不存在', HttpCode.NOT_FOUND) };
+      }
 
-    if (schedule.status === 'cancelled') {
-      await session.abortTransaction();
-      return res.status(HttpCode.BAD_REQUEST).json(fail('排班已取消', HttpCode.BAD_REQUEST));
-    }
+      if (schedule.status === 'cancelled') {
+        return { code: HttpCode.BAD_REQUEST, data: fail('排班已取消', HttpCode.BAD_REQUEST) };
+      }
 
-    schedule.status = 'cancelled';
-    await schedule.save({ session });
+      schedule.status = 'cancelled';
+      await schedule.save(session ? { session } : {});
 
-    await Slot.updateMany(
-      { scheduleId: id, status: { $ne: 'booked' } },
-      { status: 'cancelled' },
-      { session }
-    );
+      await Slot.updateMany(
+        { scheduleId: id, status: { $ne: 'booked' } },
+        { status: 'cancelled' },
+        session ? { session } : {}
+      );
 
-    await session.commitTransaction();
+      return {
+        code: HttpCode.SUCCESS,
+        data: success(null, '排班取消成功')
+      };
+    });
 
-    return res.status(HttpCode.SUCCESS).json(success(null, '排班取消成功'));
+    return res.status(result.code).json(result.data);
   } catch (error) {
-    await session.abortTransaction();
     return res.status(HttpCode.INTERNAL_ERROR).json(fail(error.message, HttpCode.INTERNAL_ERROR));
-  } finally {
-    session.endSession();
   }
 }
 

@@ -1,366 +1,307 @@
-import mongoose from 'mongoose';
 import Appointment from '../models/Appointment.js';
 import Slot from '../models/Slot.js';
 import Doctor from '../models/Doctor.js';
-import config from '../config/index.js';
 import { success, fail, HttpCode } from '../utils/response.js';
+import config from '../config/index.js';
+import { withTransaction } from '../utils/transaction.js';
 
-async function isSlotLockedExpired(slot) {
-  if (slot.status !== 'locked' || !slot.lockedAt) {
-    return false;
-  }
-  const now = Date.now();
-  const lockedTime = new Date(slot.lockedAt).getTime();
-  return (now - lockedTime) > config.slotLockDuration * 1000;
-}
+async function checkDuplicateBooking(doctorId, patientPhone, date, excludeSlotId = null) {
+  const dayStart = new Date(date);
+  dayStart.setHours(0, 0, 0, 0);
+  const dayEnd = new Date(date);
+  dayEnd.setHours(23, 59, 59, 999);
 
-async function checkDuplicateBooking(doctorId, patientPhone, slotDate, excludeAppointmentId = null) {
-  const query = {
+  const slots = await Slot.find({
     doctorId,
+    date: { $gte: dayStart, $lte: dayEnd },
+    ...(excludeSlotId ? { _id: { $ne: excludeSlotId } } : {})
+  }).select('_id');
+
+  const slotIds = slots.map(s => s._id);
+
+  const existingAppointment = await Appointment.findOne({
+    slotId: { $in: slotIds },
     patientPhone,
     status: { $in: ['pending', 'confirmed'] }
-  };
+  });
 
-  if (excludeAppointmentId) {
-    query._id = { $ne: excludeAppointmentId };
-  }
-
-  const appointments = await Appointment.find(query).populate('slotId');
-
-  const targetDateStr = new Date(slotDate).toDateString();
-
-  for (const apt of appointments) {
-    if (apt.slotId && new Date(apt.slotId.date).toDateString() === targetDateStr) {
-      return true;
-    }
-  }
-
-  return false;
+  return !!existingAppointment;
 }
 
 export async function lockSlot(req, res) {
-  const session = await mongoose.startSession();
-  session.startTransaction();
-
   try {
     const { slotId, patientName, patientPhone } = req.body;
 
-    const slot = await Slot.findById(slotId).session(session);
-    if (!slot) {
-      await session.abortTransaction();
-      return res.status(HttpCode.NOT_FOUND).json(fail('号源不存在', HttpCode.NOT_FOUND));
-    }
-
-    if (slot.status === 'locked') {
-      const expired = await isSlotLockedExpired(slot);
-      if (!expired) {
-        await session.abortTransaction();
-        return res.status(HttpCode.CONFLICT).json(fail('号源已被锁定', HttpCode.CONFLICT));
+    const result = await withTransaction(async (session) => {
+      const slot = await Slot.findById(slotId).session(session);
+      if (!slot) {
+        return { code: HttpCode.NOT_FOUND, data: fail('号源不存在', HttpCode.NOT_FOUND) };
       }
-    }
 
-    if (slot.status === 'booked') {
-      await session.abortTransaction();
-      return res.status(HttpCode.CONFLICT).json(fail('号源已被预约', HttpCode.CONFLICT));
-    }
+      if (slot.status === 'locked') {
+        const now = new Date();
+        const lockTime = new Date(slot.lockedAt);
+        const diff = (now - lockTime) / 1000;
+        if (diff < config.slotLockDuration) {
+          return { code: HttpCode.BAD_REQUEST, data: fail('号源已被锁定', HttpCode.BAD_REQUEST) };
+        }
+      }
 
-    if (slot.status === 'cancelled') {
-      await session.abortTransaction();
-      return res.status(HttpCode.BAD_REQUEST).json(fail('号源已取消', HttpCode.BAD_REQUEST));
-    }
+      if (slot.status === 'booked') {
+        return { code: HttpCode.BAD_REQUEST, data: fail('号源已被预约', HttpCode.BAD_REQUEST) };
+      }
 
-    if (slot.status === 'suspended') {
-      await session.abortTransaction();
-      return res.status(HttpCode.BAD_REQUEST).json(fail('号源已停诊', HttpCode.BAD_REQUEST));
-    }
+      if (slot.status === 'cancelled') {
+        return { code: HttpCode.BAD_REQUEST, data: fail('号源已取消', HttpCode.BAD_REQUEST) };
+      }
 
-    const isDuplicate = await checkDuplicateBooking(slot.doctorId, patientPhone, slot.date);
-    if (isDuplicate) {
-      await session.abortTransaction();
-      return res.status(HttpCode.CONFLICT).json(fail('同一时段已存在有效预约', HttpCode.CONFLICT));
-    }
+      if (slot.status === 'suspended') {
+        return { code: HttpCode.BAD_REQUEST, data: fail('号源已停诊', HttpCode.BAD_REQUEST) };
+      }
 
-    slot.status = 'locked';
-    slot.patientName = patientName;
-    slot.patientPhone = patientPhone;
-    slot.lockedAt = new Date();
-    await slot.save({ session });
+      const isDuplicate = await checkDuplicateBooking(slot.doctorId, patientPhone, slot.date);
+      if (isDuplicate) {
+        return { code: HttpCode.CONFLICT, data: fail('您已预约该医生当日号源，请勿重复预约', HttpCode.CONFLICT) };
+      }
 
-    await session.commitTransaction();
+      slot.status = 'locked';
+      slot.patientName = patientName;
+      slot.patientPhone = patientPhone;
+      slot.lockedAt = new Date();
+      await slot.save({ session });
 
-    return res.json(success({ slot }, '锁定成功'));
+      return { code: HttpCode.SUCCESS, data: success({ slot }, '号源锁定成功') };
+    });
+
+    return res.status(result.code).json(result.data);
   } catch (error) {
-    await session.abortTransaction();
     return res.status(HttpCode.INTERNAL_ERROR).json(fail(error.message, HttpCode.INTERNAL_ERROR));
-  } finally {
-    session.endSession();
   }
 }
 
 export async function confirmAppointment(req, res) {
-  const session = await mongoose.startSession();
-  session.startTransaction();
-
   try {
     const { slotId, patientName, patientPhone } = req.body;
 
-    const slot = await Slot.findById(slotId).session(session);
-    if (!slot) {
-      await session.abortTransaction();
-      return res.status(HttpCode.NOT_FOUND).json(fail('号源不存在', HttpCode.NOT_FOUND));
-    }
-
-    if (slot.status === 'locked') {
-      const expired = await isSlotLockedExpired(slot);
-      if (expired) {
-        slot.status = 'available';
-        slot.patientName = undefined;
-        slot.patientPhone = undefined;
-        slot.lockedAt = undefined;
-        await slot.save({ session });
-        await session.abortTransaction();
-        return res.status(HttpCode.CONFLICT).json(fail('锁定已超时，请重新预约', HttpCode.CONFLICT));
+    const result = await withTransaction(async (session) => {
+      const slot = await Slot.findById(slotId).session(session);
+      if (!slot) {
+        return { code: HttpCode.NOT_FOUND, data: fail('号源不存在', HttpCode.NOT_FOUND) };
       }
+
+      if (slot.status !== 'locked') {
+        return { code: HttpCode.BAD_REQUEST, data: fail('号源未锁定，请先锁定号源', HttpCode.BAD_REQUEST) };
+      }
+
       if (slot.patientPhone !== patientPhone) {
-        await session.abortTransaction();
-        return res.status(HttpCode.FORBIDDEN).json(fail('号源已被其他患者锁定', HttpCode.FORBIDDEN));
+        return { code: HttpCode.BAD_REQUEST, data: fail('号源锁定信息与预约人不一致', HttpCode.BAD_REQUEST) };
       }
-    } else if (slot.status !== 'available') {
-      await session.abortTransaction();
-      return res.status(HttpCode.CONFLICT).json(fail('号源不可用', HttpCode.CONFLICT));
-    }
 
-    const isDuplicate = await checkDuplicateBooking(slot.doctorId, patientPhone, slot.date);
-    if (isDuplicate) {
-      await session.abortTransaction();
-      return res.status(HttpCode.CONFLICT).json(fail('同一时段已存在有效预约', HttpCode.CONFLICT));
-    }
+      const now = new Date();
+      const lockTime = new Date(slot.lockedAt);
+      const diff = (now - lockTime) / 1000;
+      if (diff > config.slotLockDuration) {
+        return { code: HttpCode.BAD_REQUEST, data: fail('号源锁定已超时，请重新锁定', HttpCode.BAD_REQUEST) };
+      }
 
-    const appointment = new Appointment({
-      slotId: slot._id,
-      doctorId: slot.doctorId,
-      patientName,
-      patientPhone,
-      status: 'confirmed'
+      const isDuplicate = await checkDuplicateBooking(slot.doctorId, patientPhone, slot.date, slotId);
+      if (isDuplicate) {
+        return { code: HttpCode.CONFLICT, data: fail('您已预约该医生当日号源，请勿重复预约', HttpCode.CONFLICT) };
+      }
+
+      slot.status = 'booked';
+      await slot.save({ session });
+
+      const appointment = new Appointment({
+        slotId,
+        doctorId: slot.doctorId,
+        patientName,
+        patientPhone,
+        status: 'confirmed'
+      });
+      await appointment.save({ session });
+
+      slot.appointmentId = appointment._id;
+      await slot.save({ session });
+
+      return { code: HttpCode.SUCCESS, data: success({ appointment, slot }, '预约确认成功') };
     });
-    await appointment.save({ session });
 
-    slot.status = 'booked';
-    slot.patientName = patientName;
-    slot.patientPhone = patientPhone;
-    slot.appointmentId = appointment._id;
-    await slot.save({ session });
-
-    await session.commitTransaction();
-
-    return res.json(success({ appointment }, '预约成功'));
+    return res.status(result.code).json(result.data);
   } catch (error) {
-    await session.abortTransaction();
     return res.status(HttpCode.INTERNAL_ERROR).json(fail(error.message, HttpCode.INTERNAL_ERROR));
-  } finally {
-    session.endSession();
   }
 }
 
 export async function cancelAppointment(req, res) {
-  const session = await mongoose.startSession();
-  session.startTransaction();
-
   try {
     const { id } = req.params;
     const { reason } = req.body;
 
-    const appointment = await Appointment.findById(id).session(session);
-    if (!appointment) {
-      await session.abortTransaction();
-      return res.status(HttpCode.NOT_FOUND).json(fail('预约不存在', HttpCode.NOT_FOUND));
-    }
+    const result = await withTransaction(async (session) => {
+      const appointment = await Appointment.findById(id).session(session);
+      if (!appointment) {
+        return { code: HttpCode.NOT_FOUND, data: fail('预约不存在', HttpCode.NOT_FOUND) };
+      }
 
-    if (appointment.status === 'cancelled') {
-      await session.abortTransaction();
-      return res.status(HttpCode.BAD_REQUEST).json(fail('预约已取消', HttpCode.BAD_REQUEST));
-    }
+      if (appointment.status === 'cancelled') {
+        return { code: HttpCode.BAD_REQUEST, data: fail('预约已取消', HttpCode.BAD_REQUEST) };
+      }
 
-    appointment.status = 'cancelled';
-    appointment.cancelReason = reason;
-    await appointment.save({ session });
+      if (appointment.status === 'no_show') {
+        return { code: HttpCode.BAD_REQUEST, data: fail('预约已标记为爽约，无法取消', HttpCode.BAD_REQUEST) };
+      }
 
-    const slot = await Slot.findById(appointment.slotId).session(session);
-    if (slot) {
-      slot.status = 'available';
-      slot.patientName = undefined;
-      slot.patientPhone = undefined;
-      slot.lockedAt = undefined;
-      slot.appointmentId = undefined;
-      await slot.save({ session });
-    }
+      const slot = await Slot.findById(appointment.slotId).session(session);
 
-    await session.commitTransaction();
+      appointment.status = 'cancelled';
+      appointment.cancelReason = reason;
+      await appointment.save({ session });
 
-    return res.json(success({ appointment }, '取消成功'));
+      if (slot) {
+        slot.status = 'available';
+        slot.patientName = undefined;
+        slot.patientPhone = undefined;
+        slot.lockedAt = undefined;
+        slot.appointmentId = undefined;
+        await slot.save({ session });
+      }
+
+      return { code: HttpCode.SUCCESS, data: success({ appointment, slot }, '预约取消成功') };
+    });
+
+    return res.status(result.code).json(result.data);
   } catch (error) {
-    await session.abortTransaction();
     return res.status(HttpCode.INTERNAL_ERROR).json(fail(error.message, HttpCode.INTERNAL_ERROR));
-  } finally {
-    session.endSession();
   }
 }
 
 export async function rescheduleAppointment(req, res) {
-  const session = await mongoose.startSession();
-  session.startTransaction();
-
   try {
     const { id } = req.params;
     const { newSlotId, reason } = req.body;
 
-    const originalAppointment = await Appointment.findById(id).session(session);
-    if (!originalAppointment) {
-      await session.abortTransaction();
-      return res.status(HttpCode.NOT_FOUND).json(fail('原预约不存在', HttpCode.NOT_FOUND));
-    }
-
-    if (originalAppointment.status === 'cancelled') {
-      await session.abortTransaction();
-      return res.status(HttpCode.BAD_REQUEST).json(fail('原预约已取消', HttpCode.BAD_REQUEST));
-    }
-
-    if (originalAppointment.status === 'no_show') {
-      await session.abortTransaction();
-      return res.status(HttpCode.BAD_REQUEST).json(fail('已标记爽约的预约不能改约', HttpCode.BAD_REQUEST));
-    }
-
-    const newSlot = await Slot.findById(newSlotId).session(session);
-    if (!newSlot) {
-      await session.abortTransaction();
-      return res.status(HttpCode.NOT_FOUND).json(fail('新号源不存在', HttpCode.NOT_FOUND));
-    }
-
-    if (newSlot.status === 'locked') {
-      const expired = await isSlotLockedExpired(newSlot);
-      if (!expired) {
-        await session.abortTransaction();
-        return res.status(HttpCode.CONFLICT).json(fail('新号源已被锁定', HttpCode.CONFLICT));
+    const result = await withTransaction(async (session) => {
+      const originalAppointment = await Appointment.findById(id).session(session);
+      if (!originalAppointment) {
+        return { code: HttpCode.NOT_FOUND, data: fail('原预约不存在', HttpCode.NOT_FOUND) };
       }
-    }
 
-    if (newSlot.status === 'booked') {
-      await session.abortTransaction();
-      return res.status(HttpCode.CONFLICT).json(fail('新号源已被预约', HttpCode.CONFLICT));
-    }
+      if (originalAppointment.status !== 'confirmed') {
+        return { code: HttpCode.BAD_REQUEST, data: fail('只有已确认的预约才能改约', HttpCode.BAD_REQUEST) };
+      }
 
-    if (newSlot.status === 'cancelled') {
-      await session.abortTransaction();
-      return res.status(HttpCode.BAD_REQUEST).json(fail('新号源已取消', HttpCode.BAD_REQUEST));
-    }
+      const newSlot = await Slot.findById(newSlotId).session(session);
+      if (!newSlot) {
+        return { code: HttpCode.NOT_FOUND, data: fail('新号源不存在', HttpCode.NOT_FOUND) };
+      }
 
-    if (newSlot.status === 'suspended') {
-      await session.abortTransaction();
-      return res.status(HttpCode.BAD_REQUEST).json(fail('新号源已停诊', HttpCode.BAD_REQUEST));
-    }
+      if (newSlot.status === 'booked') {
+        return { code: HttpCode.BAD_REQUEST, data: fail('新号源已被预约', HttpCode.BAD_REQUEST) };
+      }
 
-    const isDuplicate = await checkDuplicateBooking(
-      newSlot.doctorId,
-      originalAppointment.patientPhone,
-      newSlot.date,
-      originalAppointment._id
-    );
-    if (isDuplicate) {
-      await session.abortTransaction();
-      return res.status(HttpCode.CONFLICT).json(fail('新时段已存在有效预约', HttpCode.CONFLICT));
-    }
+      if (newSlot.status === 'cancelled') {
+        return { code: HttpCode.BAD_REQUEST, data: fail('新号源已取消', HttpCode.BAD_REQUEST) };
+      }
 
-    originalAppointment.status = 'cancelled';
-    originalAppointment.cancelReason = reason;
-    await originalAppointment.save({ session });
+      if (newSlot.status === 'suspended') {
+        return { code: HttpCode.BAD_REQUEST, data: fail('新号源已停诊', HttpCode.BAD_REQUEST) };
+      }
 
-    const originalSlot = await Slot.findById(originalAppointment.slotId).session(session);
-    if (originalSlot) {
-      originalSlot.status = 'available';
-      originalSlot.patientName = undefined;
-      originalSlot.patientPhone = undefined;
-      originalSlot.lockedAt = undefined;
-      originalSlot.appointmentId = undefined;
-      await originalSlot.save({ session });
-    }
+      const isDuplicate = await checkDuplicateBooking(
+        newSlot.doctorId,
+        originalAppointment.patientPhone,
+        newSlot.date,
+        newSlotId
+      );
+      if (isDuplicate) {
+        return { code: HttpCode.CONFLICT, data: fail('您已预约该医生当日号源，请勿重复预约', HttpCode.CONFLICT) };
+      }
 
-    const newAppointment = new Appointment({
-      slotId: newSlot._id,
-      doctorId: newSlot.doctorId,
-      patientName: originalAppointment.patientName,
-      patientPhone: originalAppointment.patientPhone,
-      status: 'confirmed',
-      isRescheduled: true,
-      originalAppointmentId: originalAppointment._id
+      const oldSlot = await Slot.findById(originalAppointment.slotId).session(session);
+
+      originalAppointment.status = 'cancelled';
+      originalAppointment.cancelReason = reason || '改约';
+      await originalAppointment.save({ session });
+
+      if (oldSlot) {
+        oldSlot.status = 'available';
+        oldSlot.patientName = undefined;
+        oldSlot.patientPhone = undefined;
+        oldSlot.lockedAt = undefined;
+        oldSlot.appointmentId = undefined;
+        await oldSlot.save({ session });
+      }
+
+      newSlot.status = 'booked';
+      newSlot.patientName = originalAppointment.patientName;
+      newSlot.patientPhone = originalAppointment.patientPhone;
+      await newSlot.save({ session });
+
+      const newAppointment = new Appointment({
+        slotId: newSlotId,
+        doctorId: newSlot.doctorId,
+        patientName: originalAppointment.patientName,
+        patientPhone: originalAppointment.patientPhone,
+        status: 'confirmed',
+        isRescheduled: true,
+        originalAppointmentId: originalAppointment._id
+      });
+      await newAppointment.save({ session });
+
+      newSlot.appointmentId = newAppointment._id;
+      await newSlot.save({ session });
+
+      return { code: HttpCode.SUCCESS, data: success({
+        originalAppointment,
+        newAppointment,
+        oldSlot,
+        newSlot
+      }, '改约成功') };
     });
-    await newAppointment.save({ session });
 
-    newSlot.status = 'booked';
-    newSlot.patientName = originalAppointment.patientName;
-    newSlot.patientPhone = originalAppointment.patientPhone;
-    newSlot.appointmentId = newAppointment._id;
-    await newSlot.save({ session });
-
-    await session.commitTransaction();
-
-    return res.json(success({
-      originalAppointment,
-      newAppointment
-    }, '改约成功'));
+    return res.status(result.code).json(result.data);
   } catch (error) {
-    await session.abortTransaction();
     return res.status(HttpCode.INTERNAL_ERROR).json(fail(error.message, HttpCode.INTERNAL_ERROR));
-  } finally {
-    session.endSession();
   }
 }
 
 export async function markNoShow(req, res) {
-  const session = await mongoose.startSession();
-  session.startTransaction();
-
   try {
     const { id } = req.params;
     const { reason } = req.body;
 
-    const appointment = await Appointment.findById(id).session(session);
-    if (!appointment) {
-      await session.abortTransaction();
-      return res.status(HttpCode.NOT_FOUND).json(fail('预约不存在', HttpCode.NOT_FOUND));
-    }
+    const result = await withTransaction(async (session) => {
+      const appointment = await Appointment.findById(id).session(session);
+      if (!appointment) {
+        return { code: HttpCode.NOT_FOUND, data: fail('预约不存在', HttpCode.NOT_FOUND) };
+      }
 
-    if (appointment.status === 'cancelled') {
-      await session.abortTransaction();
-      return res.status(HttpCode.BAD_REQUEST).json(fail('已取消的预约不能标记爽约', HttpCode.BAD_REQUEST));
-    }
+      if (appointment.status !== 'confirmed') {
+        return { code: HttpCode.BAD_REQUEST, data: fail('只有已确认的预约才能标记为爽约', HttpCode.BAD_REQUEST) };
+      }
 
-    if (appointment.status === 'no_show') {
-      await session.abortTransaction();
-      return res.status(HttpCode.BAD_REQUEST).json(fail('预约已标记爽约', HttpCode.BAD_REQUEST));
-    }
+      const slot = await Slot.findById(appointment.slotId).session(session);
 
-    appointment.status = 'no_show';
-    appointment.noShowReason = reason;
-    await appointment.save({ session });
+      appointment.status = 'no_show';
+      appointment.noShowReason = reason;
+      await appointment.save({ session });
 
-    const slot = await Slot.findById(appointment.slotId).session(session);
-    if (slot) {
-      slot.status = 'available';
-      slot.patientName = undefined;
-      slot.patientPhone = undefined;
-      slot.lockedAt = undefined;
-      slot.appointmentId = undefined;
-      await slot.save({ session });
-    }
+      if (slot) {
+        slot.status = 'available';
+        slot.patientName = undefined;
+        slot.patientPhone = undefined;
+        slot.lockedAt = undefined;
+        slot.appointmentId = undefined;
+        await slot.save({ session });
+      }
 
-    await session.commitTransaction();
+      return { code: HttpCode.SUCCESS, data: success({ appointment, slot }, '已标记为爽约') };
+    });
 
-    return res.json(success({ appointment }, '标记成功'));
+    return res.status(result.code).json(result.data);
   } catch (error) {
-    await session.abortTransaction();
     return res.status(HttpCode.INTERNAL_ERROR).json(fail(error.message, HttpCode.INTERNAL_ERROR));
-  } finally {
-    session.endSession();
   }
 }
 
@@ -429,24 +370,10 @@ export async function getAppointmentDetail(req, res) {
       return res.status(HttpCode.NOT_FOUND).json(fail('预约不存在', HttpCode.NOT_FOUND));
     }
 
-    return res.json(success({ appointment }, '查询成功'));
+    return res.json(success(appointment));
   } catch (error) {
     return res.status(HttpCode.INTERNAL_ERROR).json(fail(error.message, HttpCode.INTERNAL_ERROR));
   }
 }
 
-export async function checkDuplicateBookingHandler(req, res) {
-  try {
-    const { doctorId, patientPhone, slotDate } = req.query;
-
-    if (!doctorId || !patientPhone || !slotDate) {
-      return res.status(HttpCode.BAD_REQUEST).json(fail('参数不完整', HttpCode.BAD_REQUEST));
-    }
-
-    const isDuplicate = await checkDuplicateBooking(doctorId, patientPhone, slotDate);
-
-    return res.json(success({ isDuplicate }, '查询成功'));
-  } catch (error) {
-    return res.status(HttpCode.INTERNAL_ERROR).json(fail(error.message, HttpCode.INTERNAL_ERROR));
-  }
-}
+export { checkDuplicateBooking };

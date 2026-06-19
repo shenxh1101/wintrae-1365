@@ -34,7 +34,10 @@ export async function generateSlotsFromSchedule(req, res) {
 
     const createdSlots = await Slot.insertMany(slots);
 
-    return res.status(HttpCode.SUCCESS).json(success(createdSlots, '号源生成成功'));
+    return res.status(HttpCode.SUCCESS).json(success({
+      count: createdSlots.length,
+      slots: createdSlots
+    }, '号源生成成功'));
   } catch (error) {
     return res.status(HttpCode.INTERNAL_ERROR).json(fail(error.message, HttpCode.INTERNAL_ERROR));
   }

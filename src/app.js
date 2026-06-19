@@ -4,6 +4,8 @@ import rateLimit from 'express-rate-limit';
 import mongoose from 'mongoose';
 import config from './config/index.js';
 import { notFoundHandler, errorHandler } from './middleware/errorHandler.js';
+import { success, fail, HttpCode } from './utils/response.js';
+import { splitTimeSlots } from './utils/dateUtils.js';
 
 import doctorRoutes from './routes/doctorRoutes.js';
 import scheduleRoutes from './routes/scheduleRoutes.js';
@@ -25,8 +27,34 @@ const limiter = rateLimit({
 app.use(limiter);
 
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok' });
+  const dbState = mongoose.connection.readyState;
+  const dbStatus = ['disconnected', 'connected', 'connecting', 'disconnecting'][dbState] || 'unknown';
+  res.json({ status: 'ok', db: dbStatus });
 });
+
+app.get('/test/split-slots', (req, res) => {
+  const { start = '08:00', end = '10:00', duration = '30' } = req.query;
+  const slots = splitTimeSlots(start, end, parseInt(duration));
+  res.json(success({
+    startTime: start,
+    endTime: end,
+    duration: parseInt(duration),
+    count: slots.length,
+    slots
+  }));
+});
+
+const checkDB = (req, res, next) => {
+  const dbState = mongoose.connection.readyState;
+  if (dbState !== 1) {
+    return res.status(HttpCode.INTERNAL_ERROR).json(
+      fail('数据库连接未就绪，请先启动 MongoDB 服务', HttpCode.INTERNAL_ERROR)
+    );
+  }
+  next();
+};
+
+app.use('/api', checkDB);
 
 app.use('/api/doctors', doctorRoutes);
 app.use('/api/schedules', scheduleRoutes);
@@ -40,18 +68,25 @@ app.use(errorHandler);
 
 const connectDB = async () => {
   try {
-    await mongoose.connect(config.mongodbUri);
+    await mongoose.connect(config.mongodbUri, {
+      serverSelectionTimeoutMS: 3000,
+      connectTimeoutMS: 3000,
+    });
     console.log('MongoDB connected successfully');
   } catch (error) {
-    console.error('MongoDB connection error:', error.message);
-    process.exit(1);
+    console.error('MongoDB connection failed:', error.message);
+    console.log('Server will start without database connection. API endpoints will return database error.');
   }
 };
 
-const startServer = async () => {
-  await connectDB();
+const startServer = async (skipDBConnect = false) => {
+  if (!skipDBConnect) {
+    await connectDB();
+  }
   const server = app.listen(config.port, () => {
     console.log(`Server running on port ${config.port}`);
+    console.log(`Health check: http://localhost:${config.port}/health`);
+    console.log(`Slot split test: http://localhost:${config.port}/test/split-slots`);
   });
 
   process.on('SIGTERM', () => {
@@ -65,10 +100,6 @@ const startServer = async () => {
 
   return server;
 };
-
-if (process.env.NODE_ENV !== 'test') {
-  startServer();
-}
 
 export { app, startServer };
 export default app;
