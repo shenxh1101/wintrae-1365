@@ -69,6 +69,11 @@ export async function lockSlot(req, res) {
       return res.status(HttpCode.BAD_REQUEST).json(fail('号源已取消', HttpCode.BAD_REQUEST));
     }
 
+    if (slot.status === 'suspended') {
+      await session.abortTransaction();
+      return res.status(HttpCode.BAD_REQUEST).json(fail('号源已停诊', HttpCode.BAD_REQUEST));
+    }
+
     const isDuplicate = await checkDuplicateBooking(slot.doctorId, patientPhone, slot.date);
     if (isDuplicate) {
       await session.abortTransaction();
@@ -247,6 +252,11 @@ export async function rescheduleAppointment(req, res) {
     if (newSlot.status === 'cancelled') {
       await session.abortTransaction();
       return res.status(HttpCode.BAD_REQUEST).json(fail('新号源已取消', HttpCode.BAD_REQUEST));
+    }
+
+    if (newSlot.status === 'suspended') {
+      await session.abortTransaction();
+      return res.status(HttpCode.BAD_REQUEST).json(fail('新号源已停诊', HttpCode.BAD_REQUEST));
     }
 
     const isDuplicate = await checkDuplicateBooking(

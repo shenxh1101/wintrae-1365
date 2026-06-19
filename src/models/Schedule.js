@@ -22,7 +22,7 @@ const scheduleSchema = new Schema({
   },
   type: {
     type: String,
-    enum: ['regular', 'temporary'],
+    enum: ['regular', 'temporary', 'suspension'],
     default: 'regular'
   },
   status: {
@@ -32,13 +32,16 @@ const scheduleSchema = new Schema({
   },
   totalSlots: {
     type: Number,
-    required: true
+    default: 0
+  },
+  reason: {
+    type: String
   }
 }, {
   timestamps: true
 });
 
-scheduleSchema.index({ doctorId: 1, date: 1 }, { unique: true });
+scheduleSchema.index({ doctorId: 1, date: 1 });
 
 const Schedule = mongoose.model('Schedule', scheduleSchema);
 

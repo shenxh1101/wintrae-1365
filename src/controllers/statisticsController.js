@@ -3,80 +3,110 @@ import Schedule from '../models/Schedule.js';
 import Slot from '../models/Slot.js';
 import Doctor from '../models/Doctor.js';
 import { success, fail, HttpCode } from '../utils/response.js';
-import { startOfDay, endOfDay, formatDate, dayjs } from '../utils/dateUtils.js';
+import { startOfDay, endOfDay, formatDate, parseDate } from '../utils/dateUtils.js';
 
-function calculateStats(appointments) {
+function buildSlotFilter(query) {
+  const { startDate, endDate, doctorId } = query;
+  const filter = { status: { $ne: 'cancelled' } };
+  if (startDate) filter.date = { $gte: startOfDay(parseDate(startDate)) };
+  if (endDate) {
+    filter.date = filter.date || {};
+    filter.date.$lte = endOfDay(parseDate(endDate));
+  }
+  if (doctorId) filter.doctorId = doctorId;
+  return filter;
+}
+
+function buildDoctorFilter(query) {
+  const { department, doctorId } = query;
+  const filter = {};
+  if (department) filter.department = department;
+  if (doctorId) filter._id = doctorId;
+  return filter;
+}
+
+function calcSlotStats(slots, appointments) {
+  const totalSlots = slots.length;
+  const bookedSlots = slots.filter(s => s.status === 'booked').length;
+  const availableSlots = slots.filter(s => s.status === 'available').length;
+  const suspendedSlots = slots.filter(s => s.status === 'suspended').length;
+  const effectiveTotal = totalSlots - suspendedSlots;
+
   const confirmed = appointments.filter(a => a.status === 'confirmed').length;
   const cancelled = appointments.filter(a => a.status === 'cancelled').length;
   const noShow = appointments.filter(a => a.status === 'no_show').length;
-
   const totalAppointments = confirmed + cancelled + noShow;
-  const bookedTotal = confirmed + noShow;
 
-  const cancelRate = totalAppointments > 0 ? (cancelled / totalAppointments).toFixed(4) : 0;
-  const noShowRate = bookedTotal > 0 ? (noShow / bookedTotal).toFixed(4) : 0;
+  const emptyRate = effectiveTotal > 0 ? (effectiveTotal - bookedSlots) / effectiveTotal : 0;
+  const cancelRate = totalAppointments > 0 ? cancelled / totalAppointments : 0;
 
   return {
-    appointmentCount: bookedTotal,
+    totalSlots,
+    effectiveTotal,
+    bookedSlots,
+    availableSlots,
+    suspendedSlots,
+    appointmentCount: confirmed + noShow,
     cancelCount: cancelled,
     noShowCount: noShow,
-    cancelRate: parseFloat(cancelRate),
-    noShowRate: parseFloat(noShowRate)
+    emptyRate: parseFloat(emptyRate.toFixed(4)),
+    cancelRate: parseFloat(cancelRate.toFixed(4))
   };
 }
 
 export async function getDepartmentStats(req, res) {
   try {
-    const { startDate, endDate, department, doctorId } = req.query;
+    const slotFilter = buildSlotFilter(req.query);
+    const doctorFilter = buildDoctorFilter(req.query);
 
-    const slotFilter = {};
-    if (startDate) slotFilter.date = { $gte: startOfDay(new Date(startDate)) };
-    if (endDate) {
-      slotFilter.date = slotFilter.date || {};
-      slotFilter.date.$lte = endOfDay(new Date(endDate));
-    }
-    if (doctorId) slotFilter.doctorId = doctorId;
-
-    const slots = await Slot.find(slotFilter).select('_id date doctorId');
-    const slotIds = slots.map(s => s._id);
-
-    const doctorFilter = {};
-    if (department) doctorFilter.department = department;
-    if (doctorId) doctorFilter._id = doctorId;
     const doctors = await Doctor.find(doctorFilter).select('_id name department');
     const doctorMap = new Map(doctors.map(d => [d._id.toString(), d]));
+    const validDoctorIds = new Set(doctorMap.keys());
 
-    const filteredSlots = slots.filter(s => doctorMap.has(s.doctorId.toString()));
-    const filteredSlotIds = filteredSlots.map(s => s._id);
+    const slots = await Slot.find(slotFilter).select('_id doctorId date status');
+    const filteredSlots = slots.filter(s => validDoctorIds.has(s.doctorId.toString()));
+    const slotIds = filteredSlots.map(s => s._id);
 
     const appointments = await Appointment.find({
-      slotId: { $in: filteredSlotIds },
+      slotId: { $in: slotIds },
       status: { $in: ['confirmed', 'cancelled', 'no_show'] }
-    }).populate('slotId', 'date doctorId');
+    });
 
-    const deptMap = new Map();
-    for (const apt of appointments) {
-      const doctor = doctorMap.get(apt.slotId.doctorId.toString());
+    const deptSlotMap = new Map();
+    const deptAptMap = new Map();
+
+    for (const slot of filteredSlots) {
+      const doctor = doctorMap.get(slot.doctorId.toString());
       if (!doctor) continue;
+      const dept = doctor.department;
+      if (!deptSlotMap.has(dept)) deptSlotMap.set(dept, []);
+      deptSlotMap.get(dept).push(slot);
+    }
 
-      const deptName = doctor.department;
-      if (!deptMap.has(deptName)) {
-        deptMap.set(deptName, []);
-      }
-      deptMap.get(deptName).push(apt);
+    const slotAptMap = new Map();
+    for (const apt of appointments) {
+      const sid = apt.slotId.toString();
+      if (!slotAptMap.has(sid)) slotAptMap.set(sid, []);
+      slotAptMap.get(sid).push(apt);
+    }
+
+    for (const slot of filteredSlots) {
+      const doctor = doctorMap.get(slot.doctorId.toString());
+      if (!doctor) continue;
+      const dept = doctor.department;
+      if (!deptAptMap.has(dept)) deptAptMap.set(dept, []);
+      const apts = slotAptMap.get(slot._id.toString()) || [];
+      deptAptMap.get(dept).push(...apts);
     }
 
     const stats = [];
-    for (const [deptName, apts] of deptMap.entries()) {
-      const deptStats = calculateStats(apts);
-      stats.push({
-        department: deptName,
-        ...deptStats
-      });
+    for (const [dept, deptSlots] of deptSlotMap.entries()) {
+      const deptApts = deptAptMap.get(dept) || [];
+      const s = calcSlotStats(deptSlots, deptApts);
+      stats.push({ department: dept, ...s });
     }
 
     stats.sort((a, b) => b.appointmentCount - a.appointmentCount);
-
     res.json(success(stats));
   } catch (error) {
     res.status(HttpCode.INTERNAL_ERROR).json(fail(error.message, HttpCode.INTERNAL_ERROR));
@@ -85,59 +115,58 @@ export async function getDepartmentStats(req, res) {
 
 export async function getDoctorStats(req, res) {
   try {
-    const { startDate, endDate, department, doctorId } = req.query;
+    const slotFilter = buildSlotFilter(req.query);
+    const doctorFilter = buildDoctorFilter(req.query);
 
-    const slotFilter = {};
-    if (startDate) slotFilter.date = { $gte: startOfDay(new Date(startDate)) };
-    if (endDate) {
-      slotFilter.date = slotFilter.date || {};
-      slotFilter.date.$lte = endOfDay(new Date(endDate));
-    }
-    if (doctorId) slotFilter.doctorId = doctorId;
-
-    const slots = await Slot.find(slotFilter).select('_id date doctorId');
-    const slotIds = slots.map(s => s._id);
-
-    const doctorFilter = {};
-    if (department) doctorFilter.department = department;
-    if (doctorId) doctorFilter._id = doctorId;
     const doctors = await Doctor.find(doctorFilter).select('_id name department');
     const doctorMap = new Map(doctors.map(d => [d._id.toString(), d]));
+    const validDoctorIds = new Set(doctorMap.keys());
 
-    const filteredSlots = slots.filter(s => doctorMap.has(s.doctorId.toString()));
-    const filteredSlotIds = filteredSlots.map(s => s._id);
+    const slots = await Slot.find(slotFilter).select('_id doctorId date status');
+    const filteredSlots = slots.filter(s => validDoctorIds.has(s.doctorId.toString()));
+    const slotIds = filteredSlots.map(s => s._id);
 
     const appointments = await Appointment.find({
-      slotId: { $in: filteredSlotIds },
+      slotId: { $in: slotIds },
       status: { $in: ['confirmed', 'cancelled', 'no_show'] }
-    }).populate('slotId', 'date doctorId');
+    });
 
-    const docMap = new Map();
+    const docSlotMap = new Map();
+    for (const slot of filteredSlots) {
+      const docId = slot.doctorId.toString();
+      if (!docSlotMap.has(docId)) docSlotMap.set(docId, []);
+      docSlotMap.get(docId).push(slot);
+    }
+
+    const slotAptMap = new Map();
     for (const apt of appointments) {
-      const docId = apt.slotId.doctorId.toString();
-      const doctor = doctorMap.get(docId);
-      if (!doctor) continue;
+      const sid = apt.slotId.toString();
+      if (!slotAptMap.has(sid)) slotAptMap.set(sid, []);
+      slotAptMap.get(sid).push(apt);
+    }
 
-      if (!docMap.has(docId)) {
-        docMap.set(docId, []);
-      }
-      docMap.get(docId).push(apt);
+    const docAptMap = new Map();
+    for (const slot of filteredSlots) {
+      const docId = slot.doctorId.toString();
+      if (!docAptMap.has(docId)) docAptMap.set(docId, []);
+      const apts = slotAptMap.get(slot._id.toString()) || [];
+      docAptMap.get(docId).push(...apts);
     }
 
     const stats = [];
-    for (const [docId, apts] of docMap.entries()) {
+    for (const [docId, docSlots] of docSlotMap.entries()) {
       const doctor = doctorMap.get(docId);
-      const docStats = calculateStats(apts);
+      const docApts = docAptMap.get(docId) || [];
+      const s = calcSlotStats(docSlots, docApts);
       stats.push({
         doctorId: docId,
         doctorName: doctor.name,
         department: doctor.department,
-        ...docStats
+        ...s
       });
     }
 
     stats.sort((a, b) => b.appointmentCount - a.appointmentCount);
-
     res.json(success(stats));
   } catch (error) {
     res.status(HttpCode.INTERNAL_ERROR).json(fail(error.message, HttpCode.INTERNAL_ERROR));
@@ -146,55 +175,51 @@ export async function getDoctorStats(req, res) {
 
 export async function getDailyStats(req, res) {
   try {
-    const { startDate, endDate, department, doctorId } = req.query;
+    const slotFilter = buildSlotFilter(req.query);
+    const doctorFilter = buildDoctorFilter(req.query);
 
-    const slotFilter = {};
-    if (startDate) slotFilter.date = { $gte: startOfDay(new Date(startDate)) };
-    if (endDate) {
-      slotFilter.date = slotFilter.date || {};
-      slotFilter.date.$lte = endOfDay(new Date(endDate));
-    }
-    if (doctorId) slotFilter.doctorId = doctorId;
-
-    const slots = await Slot.find(slotFilter).select('_id date doctorId');
-    const slotIds = slots.map(s => s._id);
-
-    const doctorFilter = {};
-    if (department) doctorFilter.department = department;
     const doctors = await Doctor.find(doctorFilter).select('_id department');
-    const doctorMap = new Map(doctors.map(d => [d._id.toString(), d]));
+    const validDoctorIds = new Set(doctors.map(d => d._id.toString()));
 
-    let filteredSlots = slots;
-    if (department) {
-      filteredSlots = slots.filter(s => doctorMap.has(s.doctorId.toString()));
-    }
-    const filteredSlotIds = filteredSlots.map(s => s._id);
+    const slots = await Slot.find(slotFilter).select('_id doctorId date status');
+    const filteredSlots = slots.filter(s => validDoctorIds.has(s.doctorId.toString()));
+    const slotIds = filteredSlots.map(s => s._id);
 
     const appointments = await Appointment.find({
-      slotId: { $in: filteredSlotIds },
+      slotId: { $in: slotIds },
       status: { $in: ['confirmed', 'cancelled', 'no_show'] }
-    }).populate('slotId', 'date doctorId');
+    });
 
-    const dateMap = new Map();
+    const dateSlotMap = new Map();
+    for (const slot of filteredSlots) {
+      const dateStr = formatDate(slot.date);
+      if (!dateSlotMap.has(dateStr)) dateSlotMap.set(dateStr, []);
+      dateSlotMap.get(dateStr).push(slot);
+    }
+
+    const slotAptMap = new Map();
     for (const apt of appointments) {
-      const dateStr = formatDate(apt.slotId.date);
-      if (!dateMap.has(dateStr)) {
-        dateMap.set(dateStr, []);
-      }
-      dateMap.get(dateStr).push(apt);
+      const sid = apt.slotId.toString();
+      if (!slotAptMap.has(sid)) slotAptMap.set(sid, []);
+      slotAptMap.get(sid).push(apt);
+    }
+
+    const dateAptMap = new Map();
+    for (const slot of filteredSlots) {
+      const dateStr = formatDate(slot.date);
+      if (!dateAptMap.has(dateStr)) dateAptMap.set(dateStr, []);
+      const apts = slotAptMap.get(slot._id.toString()) || [];
+      dateAptMap.get(dateStr).push(...apts);
     }
 
     const stats = [];
-    for (const [date, apts] of dateMap.entries()) {
-      const dayStats = calculateStats(apts);
-      stats.push({
-        date,
-        ...dayStats
-      });
+    for (const [date, daySlots] of dateSlotMap.entries()) {
+      const dayApts = dateAptMap.get(date) || [];
+      const s = calcSlotStats(daySlots, dayApts);
+      stats.push({ date, ...s });
     }
 
     stats.sort((a, b) => a.date.localeCompare(b.date));
-
     res.json(success(stats));
   } catch (error) {
     res.status(HttpCode.INTERNAL_ERROR).json(fail(error.message, HttpCode.INTERNAL_ERROR));
@@ -205,11 +230,11 @@ export async function getAbnormalSchedules(req, res) {
   try {
     const { startDate, endDate, minSlots = 0 } = req.query;
 
-    const scheduleFilter = { status: 'active' };
-    if (startDate) scheduleFilter.date = { $gte: startOfDay(new Date(startDate)) };
+    const scheduleFilter = { status: 'active', type: { $ne: 'suspension' } };
+    if (startDate) scheduleFilter.date = { $gte: startOfDay(parseDate(startDate)) };
     if (endDate) {
       scheduleFilter.date = scheduleFilter.date || {};
-      scheduleFilter.date.$lte = endOfDay(new Date(endDate));
+      scheduleFilter.date.$lte = endOfDay(parseDate(endDate));
     }
 
     const schedules = await Schedule.find(scheduleFilter)
@@ -221,9 +246,7 @@ export async function getAbnormalSchedules(req, res) {
     const slotMap = new Map();
     for (const slot of slots) {
       const sid = slot.scheduleId.toString();
-      if (!slotMap.has(sid)) {
-        slotMap.set(sid, []);
-      }
+      if (!slotMap.has(sid)) slotMap.set(sid, []);
       slotMap.get(sid).push(slot);
     }
 
@@ -234,9 +257,7 @@ export async function getAbnormalSchedules(req, res) {
     const aptMap = new Map();
     for (const apt of appointments) {
       const sid = apt.slotId.toString();
-      if (!aptMap.has(sid)) {
-        aptMap.set(sid, []);
-      }
+      if (!aptMap.has(sid)) aptMap.set(sid, []);
       aptMap.get(sid).push(apt);
     }
 
@@ -245,8 +266,8 @@ export async function getAbnormalSchedules(req, res) {
       const scheduleSlots = slotMap.get(schedule._id.toString()) || [];
       if (scheduleSlots.length < minSlots) continue;
 
-      const allCancelled = scheduleSlots.length > 0 && 
-        scheduleSlots.every(s => s.status === 'cancelled');
+      const allCancelled = scheduleSlots.length > 0 &&
+        scheduleSlots.every(s => s.status === 'cancelled' || s.status === 'suspended');
 
       let appointmentCount = 0;
       for (const slot of scheduleSlots) {
@@ -275,7 +296,6 @@ export async function getAbnormalSchedules(req, res) {
     }
 
     abnormalSchedules.sort((a, b) => a.date.localeCompare(b.date));
-
     res.json(success(abnormalSchedules));
   } catch (error) {
     res.status(HttpCode.INTERNAL_ERROR).json(fail(error.message, HttpCode.INTERNAL_ERROR));

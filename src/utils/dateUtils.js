@@ -1,4 +1,7 @@
 import dayjs from 'dayjs';
+import customParseFormat from 'dayjs/plugin/customParseFormat';
+
+dayjs.extend(customParseFormat);
 
 export function formatDate(date, format = 'YYYY-MM-DD') {
   return dayjs(date).format(format);
@@ -45,19 +48,24 @@ export function endOfDay(date) {
 }
 
 export function splitTimeSlots(startTime, endTime, durationMinutes) {
-  const slots = [];
-  let current = dayjs(startTime);
-  const end = dayjs(endTime);
+  const refDate = '2000-01-01';
+  const start = dayjs(`${refDate} ${startTime}`, 'YYYY-MM-DD HH:mm');
+  const end = dayjs(`${refDate} ${endTime}`, 'YYYY-MM-DD HH:mm');
 
-  while (current.isBefore(end) || current.isSame(end, 'minute')) {
+  if (!start.isValid() || !end.isValid() || !start.isBefore(end)) {
+    return [];
+  }
+
+  const slots = [];
+  let current = start;
+
+  while (current.isBefore(end)) {
     const slotEnd = current.add(durationMinutes, 'minute');
     if (slotEnd.isAfter(end)) break;
 
     slots.push({
       startTime: current.format('HH:mm'),
-      endTime: slotEnd.format('HH:mm'),
-      startDateTime: current.format(),
-      endDateTime: slotEnd.format()
+      endTime: slotEnd.format('HH:mm')
     });
 
     current = slotEnd;

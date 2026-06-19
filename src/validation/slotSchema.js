@@ -8,7 +8,7 @@ const generateSlotsSchema = Joi.object({
 const querySlotSchema = Joi.object({
   doctorId: Joi.string().optional(),
   date: Joi.string().optional(),
-  status: Joi.string().valid('available', 'locked', 'booked', 'cancelled').optional()
+  status: Joi.string().valid('available', 'locked', 'booked', 'cancelled', 'suspended').optional()
 });
 
 export {

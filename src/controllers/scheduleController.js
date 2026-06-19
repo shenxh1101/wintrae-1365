@@ -25,10 +25,10 @@ export async function createWeeklySchedule(req, res) {
       if (dailySchedule) {
         schedules.push({
           doctorId,
-          date: currentDate,
+          date: startOfDay(currentDate),
           startTime: dailySchedule.startTime,
           endTime: dailySchedule.endTime,
-          totalSlots: dailySchedule.totalSlots,
+          totalSlots: dailySchedule.totalSlots || 0,
           type: 'regular',
           status: 'active'
         });
@@ -45,7 +45,7 @@ export async function createWeeklySchedule(req, res) {
 
 export async function createTemporarySchedule(req, res) {
   try {
-    const { doctorId, date, startTime, endTime, totalSlots, type } = req.body;
+    const { doctorId, date, startTime, endTime, totalSlots } = req.body;
 
     const doctor = await Doctor.findById(doctorId);
     if (!doctor) {
@@ -54,19 +54,84 @@ export async function createTemporarySchedule(req, res) {
 
     const schedule = new Schedule({
       doctorId,
-      date: parseDate(date),
+      date: startOfDay(parseDate(date)),
       startTime,
       endTime,
-      totalSlots,
-      type: type || 'temporary',
+      totalSlots: totalSlots || 0,
+      type: 'temporary',
       status: 'active'
     });
 
     await schedule.save();
 
-    return res.status(HttpCode.SUCCESS).json(success(schedule, '临时排班创建成功'));
+    return res.status(HttpCode.SUCCESS).json(success(schedule, '临时出诊排班创建成功'));
   } catch (error) {
     return res.status(HttpCode.INTERNAL_ERROR).json(fail(error.message, HttpCode.INTERNAL_ERROR));
+  }
+}
+
+export async function createSuspension(req, res) {
+  const session = await mongoose.startSession();
+  session.startTransaction();
+
+  try {
+    const { doctorId, date, startTime, endTime, reason } = req.body;
+
+    const doctor = await Doctor.findById(doctorId);
+    if (!doctor) {
+      await session.abortTransaction();
+      return res.status(HttpCode.NOT_FOUND).json(fail('医生不存在', HttpCode.NOT_FOUND));
+    }
+
+    const suspension = new Schedule({
+      doctorId,
+      date: startOfDay(parseDate(date)),
+      startTime,
+      endTime,
+      type: 'suspension',
+      status: 'active',
+      totalSlots: 0,
+      reason: reason || ''
+    });
+    await suspension.save({ session });
+
+    const dayStart = startOfDay(parseDate(date));
+    const dayEnd = endOfDay(parseDate(date));
+
+    const slotFilter = {
+      doctorId,
+      date: { $gte: dayStart, $lte: dayEnd },
+      startTime: { $gte: startTime },
+      endTime: { $lte: endTime },
+      status: { $in: ['available', 'locked'] }
+    };
+
+    const affectedSlots = await Slot.find(slotFilter).session(session);
+
+    for (const slot of affectedSlots) {
+      if (slot.status === 'locked') {
+        const Appointment = (await import('../models/Appointment.js')).default;
+        await Appointment.updateOne(
+          { slotId: slot._id, status: { $in: ['pending', 'confirmed'] } },
+          { status: 'cancelled', cancelReason: `医生停诊：${reason || ''}` },
+          { session }
+        );
+      }
+      slot.status = 'suspended';
+      await slot.save({ session });
+    }
+
+    await session.commitTransaction();
+
+    return res.status(HttpCode.SUCCESS).json(success({
+      suspension,
+      suspendedSlotCount: affectedSlots.length
+    }, '停诊创建成功，对应号源已冻结'));
+  } catch (error) {
+    await session.abortTransaction();
+    return res.status(HttpCode.INTERNAL_ERROR).json(fail(error.message, HttpCode.INTERNAL_ERROR));
+  } finally {
+    session.endSession();
   }
 }
 
@@ -92,7 +157,7 @@ export async function cancelSchedule(req, res) {
     await schedule.save({ session });
 
     await Slot.updateMany(
-      { scheduleId: id },
+      { scheduleId: id, status: { $ne: 'booked' } },
       { status: 'cancelled' },
       { session }
     );
@@ -110,11 +175,14 @@ export async function cancelSchedule(req, res) {
 
 export async function getScheduleList(req, res) {
   try {
-    const { doctorId, startDate, endDate } = req.query;
+    const { doctorId, startDate, endDate, type } = req.query;
 
     const query = {};
     if (doctorId) {
       query.doctorId = doctorId;
+    }
+    if (type) {
+      query.type = type;
     }
     if (startDate || endDate) {
       query.date = {};
@@ -126,7 +194,9 @@ export async function getScheduleList(req, res) {
       }
     }
 
-    const schedules = await Schedule.find(query).sort({ date: 1, startTime: 1 });
+    const schedules = await Schedule.find(query)
+      .populate('doctorId', 'name department title')
+      .sort({ date: 1, startTime: 1 });
 
     return res.status(HttpCode.SUCCESS).json(success(schedules));
   } catch (error) {
@@ -143,7 +213,9 @@ export async function getScheduleDetail(req, res) {
       return res.status(HttpCode.NOT_FOUND).json(fail('排班不存在', HttpCode.NOT_FOUND));
     }
 
-    return res.status(HttpCode.SUCCESS).json(success(schedule));
+    const slots = await Slot.find({ scheduleId: id }).sort({ startTime: 1 });
+
+    return res.status(HttpCode.SUCCESS).json(success({ schedule, slots }));
   } catch (error) {
     return res.status(HttpCode.INTERNAL_ERROR).json(fail(error.message, HttpCode.INTERNAL_ERROR));
   }

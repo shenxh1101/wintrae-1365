@@ -27,7 +27,7 @@ const slotSchema = new Schema({
   },
   status: {
     type: String,
-    enum: ['available', 'locked', 'booked', 'cancelled'],
+    enum: ['available', 'locked', 'booked', 'cancelled', 'suspended'],
     default: 'available'
   },
   patientName: {
