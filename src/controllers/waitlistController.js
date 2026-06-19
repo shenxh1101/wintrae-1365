@@ -93,9 +93,13 @@ export async function cancelWaitlist(req, res) {
 
 export async function getWaitlistStatus(req, res) {
   try {
-    const { patientPhone, doctorId, date, slotId } = req.query;
+    const { patientPhone, doctorId, date, slotId, status } = req.query;
 
-    const query = { patientPhone, status: 'waiting' };
+    const query = { patientPhone };
+
+    if (status) {
+      query.status = status;
+    }
 
     if (slotId) {
       query.slotId = slotId;
@@ -112,7 +116,7 @@ export async function getWaitlistStatus(req, res) {
     const waitlists = await Waitlist.find(query)
       .populate('slotId')
       .populate('doctorId', 'name department title')
-      .sort({ position: 1 });
+      .sort({ createdAt: -1 });
 
     return res.status(HttpCode.SUCCESS).json(success(waitlists, '查询成功'));
   } catch (error) {

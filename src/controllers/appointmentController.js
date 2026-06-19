@@ -1,6 +1,7 @@
 import Appointment from '../models/Appointment.js';
 import Slot from '../models/Slot.js';
 import Doctor from '../models/Doctor.js';
+import Waitlist from '../models/Waitlist.js';
 import { success, fail, HttpCode } from '../utils/response.js';
 import config from '../config/index.js';
 import { withTransaction } from '../utils/transaction.js';
@@ -59,6 +60,20 @@ export async function lockSlot(req, res) {
 
       if (slot.status === 'suspended') {
         return { code: HttpCode.BAD_REQUEST, data: fail('号源已停诊', HttpCode.BAD_REQUEST) };
+      }
+
+      const notifiedWaitlist = await Waitlist.findOne({
+        slotId,
+        status: 'notification_sent'
+      }).session(session);
+
+      if (notifiedWaitlist) {
+        if (notifiedWaitlist.patientPhone !== patientPhone) {
+          return { code: HttpCode.BAD_REQUEST, data: fail('该号源已预留给候补患者', HttpCode.BAD_REQUEST) };
+        }
+        if (notifiedWaitlist.expiredAt && new Date() > new Date(notifiedWaitlist.expiredAt)) {
+          return { code: HttpCode.BAD_REQUEST, data: fail('候补预约已过期，请重新加入候补', HttpCode.BAD_REQUEST) };
+        }
       }
 
       const isDuplicate = await checkDuplicateBooking(slot.doctorId, patientPhone, slot.date);

@@ -337,7 +337,7 @@ export async function getAdminSummary(req, res) {
     }).select('_id slotId patientName patientPhone status cancelReason createdAt');
 
     const waitlists = await Waitlist.find({
-      doctorId: { $in: doctorIds },
+      slotId: { $in: slotIds },
       status: { $in: ['waiting', 'notification_sent'] }
     }).select('_id slotId doctorId patientName patientPhone position status createdAt');
 
@@ -346,7 +346,7 @@ export async function getAdminSummary(req, res) {
       const docSlots = slots.filter(s => s.doctorId.toString() === doctor._id.toString());
       const docSlotIds = docSlots.map(s => s._id);
       const docAppointments = appointments.filter(a => docSlotIds.some(id => id.toString() === a.slotId.toString()));
-      const docWaitlists = waitlists.filter(w => w.doctorId.toString() === doctor._id.toString());
+      const docWaitlists = waitlists.filter(w => docSlotIds.some(id => id.toString() === w.slotId.toString()));
       const docSchedules = schedules.filter(s => s.doctorId.toString() === doctor._id.toString());
 
       const totalSlots = docSlots.length;
